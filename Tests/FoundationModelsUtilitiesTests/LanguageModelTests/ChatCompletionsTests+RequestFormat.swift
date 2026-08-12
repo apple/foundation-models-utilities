@@ -82,5 +82,38 @@ extension ChatCompletionsTests {
       let request = try capturedRequest()
       #expect(request.url?.path.hasSuffix("/chat/completions") == true)
     }
+
+    @Test func `does not duplicate version when base URL includes v1`() async throws {
+      MockSSEProtocol.handler = { _ in (200, MockSSE.text("OK")) }
+
+      let model = makeMockModel(url: URL(string: "https://mock-llm.test/v1")!)
+      let session = LanguageModelSession(model: model)
+      let _ = try await session.respond(to: "test")
+
+      let request = try capturedRequest()
+      #expect(request.url?.path == "/v1/chat/completions")
+    }
+
+    @Test func `preserves alternate version segments in base URL`() async throws {
+      MockSSEProtocol.handler = { _ in (200, MockSSE.text("OK")) }
+
+      let model = makeMockModel(url: URL(string: "https://mock-llm.test/api/v3")!)
+      let session = LanguageModelSession(model: model)
+      let _ = try await session.respond(to: "test")
+
+      let request = try capturedRequest()
+      #expect(request.url?.path == "/api/v3/chat/completions")
+    }
+
+    @Test func `injects v1 when base URL has no version segment`() async throws {
+      MockSSEProtocol.handler = { _ in (200, MockSSE.text("OK")) }
+
+      let model = makeMockModel(url: URL(string: "https://mock-llm.test")!)
+      let session = LanguageModelSession(model: model)
+      let _ = try await session.respond(to: "test")
+
+      let request = try capturedRequest()
+      #expect(request.url?.path == "/v1/chat/completions")
+    }
   }
 }

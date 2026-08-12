@@ -43,7 +43,9 @@ public struct ChatCompletionsLanguageModel: Sendable, LanguageModel {
 
   /// The base URL of the chat completions endpoint. The path
   /// `/v1/chat/completions` is appended automatically when the supplied
-  /// URL does not already include a `v1` segment.
+  /// URL does not already include a version segment matching `v<digits>`
+  /// (for example `v1`, `v2`, or `v3`). When a version segment is
+  /// present, only `/chat/completions` is appended.
   public var url: URL
 
   /// Headers added to every outgoing request, merged on top of the
@@ -447,14 +449,6 @@ public struct ChatCompletionsLanguageModel: Sendable, LanguageModel {
               )
             )
           }
-        case .custom:
-          throw LanguageModelError.unsupportedTranscriptContent(
-            LanguageModelError.UnsupportedTranscriptContent(
-              unsupportedContent: [entry],
-              debugDescription: "Custom segments are not supported by \(Self.self)"
-            )
-          )
-
         @unknown default:
           throw LanguageModelError.unsupportedTranscriptContent(
             LanguageModelError.UnsupportedTranscriptContent(
@@ -632,7 +626,9 @@ private struct ChatCompletionsClient {
   }
 
   private func buildURLRequest(for request: ChatCompletionRequest) throws -> URLRequest {
-    let isVersioned = baseURL.pathComponents.contains("v1")
+    let isVersioned = baseURL.pathComponents.contains { component in
+      component.wholeMatch(of: #/v\d+/#) != nil
+    }
     let endpoint = isVersioned ? "/chat/completions" : "/v1/chat/completions"
     let url = baseURL.appendingPathComponent(endpoint)
     var urlRequest = URLRequest(url: url)

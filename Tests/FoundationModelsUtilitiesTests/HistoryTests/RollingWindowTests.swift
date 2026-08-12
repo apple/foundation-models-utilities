@@ -16,66 +16,67 @@ import Testing
 @Suite
 struct RollingWindowTests {
   @Test func `preserves entries when under limit`() async throws {
-    let model = MockModel(textResponse: "OK", tokenCount: 1)
-    let session = LanguageModelSession(profile: WindowedProfile(windowSize: 10).model(model))
+    let recorder = TranscriptRecorder()
+    let model = MockModel(textResponse: "OK", tokenCount: 1, recorder: recorder)
+    let profile = WindowedProfile(windowSize: 10).model(model)
+    let session = LanguageModelSession(profile: profile)
 
     let _ = try await session.respond(to: "first")
     let _ = try await session.respond(to: "second")
 
-    // Window is larger than the transcript, so nothing is trimmed.
+    // Window is larger than the transcript, so the model sees the full history
+    // on its final turn.
     #expect(
-      session.transcriptSummary == [
+      recorder.transcripts.last?.summary == [
         .instructions,
         .prompt("first"),
         .response("OK"),
-        .prompt("second"),
-        .response("OK")
+        .prompt("second")
       ]
     )
   }
 
   @Test func `trims to the most recent entries`() async throws {
-    let model = MockModel(textResponse: "OK", tokenCount: 1)
-    let session = LanguageModelSession(profile: WindowedProfile(windowSize: 3).model(model))
+    let recorder = TranscriptRecorder()
+    let model = MockModel(textResponse: "OK", tokenCount: 1, recorder: recorder)
+    let profile = WindowedProfile(windowSize: 3).model(model)
+    let session = LanguageModelSession(profile: profile)
 
     let _ = try await session.respond(to: "first")
     let _ = try await session.respond(to: "second")
     let _ = try await session.respond(to: "third")
 
-    // On the third prompt the history exceeds the window of 3 and is trimmed to
-    // its most recent entries, dropping the first prompt/response pair. The
-    // window lands on a prompt boundary, so the surviving transcript stays
-    // well-formed.
+    // On the third prompt the history exceeds the window of 3, so the model
+    // sees only the last three entries — the first prompt/response pair and
+    // the instructions are dropped from the transcript sent to the model.
     #expect(
-      session.transcriptSummary == [
-        .instructions,
+      recorder.transcripts.last?.summary == [
         .prompt("second"),
         .response("OK"),
-        .prompt("third"),
-        .response("OK")
+        .prompt("third")
       ]
     )
   }
 
   @Test
   func `splits a prompt-response pair when the window is even`() async throws {
-    let model = MockModel(textResponse: "OK", tokenCount: 1)
-    let session = LanguageModelSession(profile: WindowedProfile(windowSize: 2).model(model))
+    let recorder = TranscriptRecorder()
+    let model = MockModel(textResponse: "OK", tokenCount: 1, recorder: recorder)
+    let profile = WindowedProfile(windowSize: 2).model(model)
+    let session = LanguageModelSession(profile: profile)
 
     let _ = try await session.respond(to: "first")
     let _ = try await session.respond(to: "second")
     let _ = try await session.respond(to: "third")
     let _ = try await session.respond(to: "fourth")
 
-    // The naive suffix(2) trim repeatedly cuts between a prompt and its
-    // response, so the window starts with an orphaned response. This documents
-    // the (buggy) naive outcome; in practice it crashes partway through.
+    // The naive suffix(2) trim cuts between the third prompt's response and
+    // the fourth prompt, so the model sees an orphaned response followed by
+    // the new prompt.
     #expect(
-      session.transcriptSummary == [
-        .instructions,
+      recorder.transcripts.last?.summary == [
         .response("OK"),
-        .prompt("fourth"),
-        .response("OK")
+        .prompt("fourth")
       ]
     )
   }

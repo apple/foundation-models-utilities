@@ -23,17 +23,14 @@ enum EntrySummary: Equatable {
   case instructions
 }
 
-extension LanguageModelSession {
-  /// The conversational entries of `session`'s transcript, summarized in order.
-  /// The instructions entry injected by the profile is dropped so the
-  /// assertions focus on the prompt/response flow.
-  var transcriptSummary: [EntrySummary] {
-    transcript.map(\.summary)
+extension Transcript {
+  var summary: [EntrySummary] {
+    map(\.summary)
   }
 }
 
 extension Transcript.Entry {
-  fileprivate var summary: EntrySummary {
+  var summary: EntrySummary {
     switch self {
     case .prompt(let prompt):
       return .prompt(prompt.segments.text)

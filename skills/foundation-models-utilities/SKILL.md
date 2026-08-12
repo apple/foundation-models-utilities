@@ -95,7 +95,7 @@ When the previous turn produced reasoning, the executor echoes it back as `reaso
 - HTTP non-200 → `ChatCompletionsLanguageModel.RequestError.httpError(statusCode:data:)`.
 - Server emits `{"error":{"message",...}}` mid-stream → `ChatCompletionsLanguageModel.APIError(message:type:param:code:)`.
 - Malformed SSE → `ChatCompletionsLanguageModel.RequestError.invalidStreamData`.
-- Custom segments / unsupported attachments in the transcript → `LanguageModelError.unsupportedTranscriptContent`.
+- Unsupported attachment kinds in the transcript → `LanguageModelError.unsupportedTranscriptContent`.
 
 Both `RequestError` and `APIError` conform to `LocalizedError`; pattern-match on them at the call site if you need to translate to UI.
 
@@ -295,7 +295,6 @@ let response = try await session.respond(to: userPrompt)
 - **History modifiers run outside-in.** Apply summarization first in source order so it ends up innermost; cheaper modifiers go last (they apply first at runtime).
 - **`summarizeHistory` thresholds on entry count.** If you expect long, low-entry-count chats with big segments, the threshold may never trip. Add a `rollingWindow` for a token-bounded fallback.
 - **`summarizeHistory` requires the trailing entry to be `.prompt`.** It is a no-op for any other trailing entry kind — don't rely on it firing mid-tool-call.
-- **Custom segments aren't supported by `ChatCompletionsLanguageModel`.** It throws `unsupportedTranscriptContent` for `Transcript.CustomSegment` values. If you emit custom segments via your own `LanguageModel`, render them yourself before they reach this executor.
 
 ## Package layout
 

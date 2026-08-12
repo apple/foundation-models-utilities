@@ -41,12 +41,8 @@ extension LanguageModelSession.DynamicProfile {
 }
 
 private struct DropCompletedToolCallsModifier: LanguageModelSession.DynamicProfileModifier {
-  @SessionProperty(\.history)
-  private var history
-
   func body(content: Content) -> some DynamicProfile {
-    content.onPrompt {
-
+    content.historyTransform { history in
       let lastOutputIndex =
         history.lastIndex(where: { entry in
           if case .response = entry { return true }
@@ -62,7 +58,7 @@ private struct DropCompletedToolCallsModifier: LanguageModelSession.DynamicProfi
 
       let suffix = history.suffix(from: lastOutputIndex)
 
-      history = prefix + suffix
+      return prefix + suffix
     }
   }
 }

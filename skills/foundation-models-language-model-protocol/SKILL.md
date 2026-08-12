@@ -269,7 +269,7 @@ public struct LanguageModelExecutorGenerationRequest: Sendable {
   public var schema: GenerationSchema?
   public var generationOptions: GenerationOptions
   public var contextOptions: ContextOptions
-  public var metadata: [String: any Sendable & Codable & Equatable]
+  public var metadata: [String: GeneratedContent]
 }
 ```
 
@@ -281,7 +281,7 @@ public struct LanguageModelExecutorGenerationRequest: Sendable {
 | `schema` | Optional `GenerationSchema` describing required JSON output shape. | Forward into your provider's structured-output / JSON-mode field. Skip if you didn't declare `.guidedGeneration`. |
 | `generationOptions` | Sampling controls: `temperature`, `samplingMode`, `maximumResponseTokens`, `toolCallingMode`. | Translate each present field into your provider's equivalent parameter. Treat `nil` fields as "use provider default". |
 | `contextOptions` | Prompting controls: `includeSchemaInPrompt`, `reasoningLevel`. | Use `reasoningLevel` to set your provider's thinking-budget knob. `includeSchemaInPrompt` tells you whether to inline the JSON schema into the system prompt. |
-| `metadata` | Developer-provided dictionary passed at the call site. | Forward to your provider's metadata field for analytics, or define well-known keys for an escape hatch (e.g. a `passthrough` key for forwarding raw provider-specific options). |
+| `metadata` | Developer-provided dictionary passed at the call site. Values arrive as `GeneratedContent` — read them out with `try value.value(String.self)` (or whatever type you expect). | Forward to your provider's metadata field for analytics, or define well-known keys for an escape hatch (e.g. a `passthrough` key for forwarding raw provider-specific options). |
 
 ### Inspecting option types
 
@@ -358,10 +358,9 @@ Events are sent on `LanguageModelExecutorGenerationChannel` via `await channel.s
 |---|---|
 | `.appendText(_:segmentID:tokenCount:)` | Each chunk of model-generated user-facing text. |
 | `.replaceTextSegment(_:segmentID:tokenCount:)` | Whole-segment replacement when your provider sends a final corrected version. |
-| `.updateCustomSegment(_:)` | A value conforming to the `Transcript.CustomSegment` protocol — provider-specific structured payloads. See "Custom segments" below. |
 | `.addAttachmentSegment(_:)` | Add a `Transcript.AttachmentSegment` (currently image content) to the response. Use this when your model emits non-text output inline — e.g. a generated diagram, edited image, or visual artifact. Each call ADDS a new segment; pass a stable `id` if you'll later remove it. See "Attachment segments" below. |
 | `.removeAttachmentSegment(_:)` | Remove a previously-added attachment by passing the `Transcript.AttachmentSegment` to drop. Symmetric to `.removeToolCall(_:)` — use when the model retracts an attachment mid-stream, or as the first half of a remove-then-add replacement. |
-| `.updateMetadata(_:)` | Wholesale snapshot of entry metadata. Re-emit every key on every event. |
+| `.updateMetadata(_:)` | Wholesale snapshot of entry metadata. Takes `[String: any ConvertibleToGeneratedContent]`, so pass values unwrapped (`["provider": "acme", "attempt": 2]`). Re-emit every key on every event. |
 | `.updateUsage(input:output:)` | Cumulative running totals. Each event REPLACES prior totals (does not add). Authoritative. |
 
 ### Reasoning events — `.reasoning(entryID:action:)`
@@ -400,52 +399,39 @@ Inner `ToolCall.Action` — what you set on `.toolCall(id:name:action:)`:
 
 > If your provider emits reasoning interleaved with tool calls (e.g. a thought trace before picking a function), send it as a `.reasoning(entryID:..., action: ...)` event. Reasoning has its own transcript entries — they sit alongside the tool-calls entry in the transcript, not inside it.
 
-## Custom segments
+## Structured payloads — use metadata
 
-`Transcript.CustomSegment` is a **protocol**, not a concrete type. When your provider returns a structured payload that doesn't fit any of the framework's built-in segment kinds (text, reasoning, citations, advisories), define your own type that conforms to the protocol, and ship it inside an `.updateCustomSegment(...)` event.
+When your provider returns a structured payload that doesn't fit any of the framework's built-in segment kinds (text, reasoning, attachments, citations, advisories), put it in entry metadata with `.updateMetadata(_:)`. Values are stored as `GeneratedContent`, so nested objects and arrays round-trip and survive transcript serialization.
 
-```swift
-public protocol CustomSegment: Sendable, Identifiable, Equatable, CustomStringConvertible,
-  PromptRepresentable, InstructionsRepresentable
-{
-  associatedtype Content: Sendable & Equatable & Codable
-
-  var id: String { get }
-  var content: Content { get }
-}
-```
-
-The associated `Content` type is yours to design — it just has to be `Sendable & Equatable & Codable`. The framework uses `PromptRepresentable` / `InstructionsRepresentable` to know how to fold the segment back into a future prompt when this entry becomes part of the transcript on a subsequent turn, so make those conformances render the segment in a form the model can usefully read.
+`.updateMetadata(_:)` takes `[String: any ConvertibleToGeneratedContent]`. `String`, `Int`, `Double`, `Bool`, `Decimal`, arrays of those, and any `@Generable` type conform. For an ad-hoc nested object, build a `GeneratedContent(properties:)` — a plain Swift dictionary does *not* conform:
 
 ```swift
-public struct WebSearchResults: Transcript.CustomSegment {
-  public let id: String
-  public let content: [Result]
-
-  public struct Result: Sendable, Equatable, Codable {
-    public let title: String
-    public let url: URL
-    public let snippet: String
-  }
-
-  public var description: String {
-    content.map { "• \($0.title) — \($0.url)" }.joined(separator: "\n")
-  }
-
-  public var promptRepresentation: Prompt { Prompt(description) }
-  public var instructionsRepresentation: Instructions { Instructions(description) }
+// Web-search results as response metadata:
+let searchResults = results.map { result in
+  GeneratedContent(properties: ["title": result.title, "url": result.url.absoluteString])
 }
 
-// Emit as part of a response:
 await channel.send(
   .response(
     entryID: responseEntryID,
-    action: .updateCustomSegment(WebSearchResults(id: UUID().uuidString, content: results))
+    action: .updateMetadata(["searchResults": searchResults])
   )
 )
 ```
 
-Reach for a custom segment when you have a structured payload the developer needs to read back later (citations, web-search results, retrieval hits, debug traces). For free-form text, use `.response(action: .appendText(...))` or `.reasoning(action: .appendText(...))` instead.
+The developer reads it back off `Transcript.Response.metadata`, which is `[String: GeneratedContent]`:
+
+```swift
+if let results = response.metadata["searchResults"] {
+  for result in try results.value([GeneratedContent].self) {
+    let title = try result.value(String.self, forProperty: "title")
+  }
+}
+```
+
+If the payload has a fixed shape, declaring it `@Generable` is nicer on both sides — pass the value straight into `.updateMetadata` and read it back with `try results.value([SearchResult].self)`.
+
+Metadata is a wholesale snapshot — re-emit every key you want preserved on each event.
 
 ## Attachment segments
 
@@ -493,7 +479,7 @@ await channel.send(
 
 There is no `replaceAttachmentSegment` — to replace an attachment with a refined version, send a `removeAttachmentSegment` followed by a fresh `addAttachmentSegment` (with either the same `id` or a new one). Each `addAttachmentSegment` ADDS a new segment; it does not replace an existing one of the same id.
 
-Reach for an attachment segment whenever your provider returns binary media as part of the assistant turn — generated images, image edits, or visual diagnostic artifacts. For provider-specific *metadata about* media (e.g. a moderation label on an image), prefer `.updateMetadata` or a `Transcript.CustomSegment`.
+Reach for an attachment segment whenever your provider returns binary media as part of the assistant turn — generated images, image edits, or visual diagnostic artifacts. For provider-specific *metadata about* media (e.g. a moderation label on an image), use `.updateMetadata`.
 
 ## Translating `request.transcript` → provider request
 
@@ -551,7 +537,7 @@ Throw typed `LanguageModelError` cases so the framework can surface user-friendl
 | `.guardrailViolation(GuardrailViolation)` | — | Provider's safety system flagged the prompt or the response. |
 | `.refusal(Refusal)` | `explanation: String` (required by the public initializer) | Model declined to answer for non-safety reasons (e.g. asked for something out of scope). Surfaced to the developer via `refusal.explanation` / `refusal.explanationStream`. |
 | `.unsupportedCapability(UnsupportedCapability)` | `capability: LanguageModelCapabilities.Capability` | A capability you didn't declare was requested. The framework throws this for you when you under-declare — only throw it manually when your provider rejects a capability mid-stream. |
-| `.unsupportedTranscriptContent(UnsupportedTranscriptContent)` | `unsupportedContent: [Transcript.Entry]` | The transcript contains content the model can't process — unsupported file types, corrupted data, or a custom segment your provider doesn't recognize. |
+| `.unsupportedTranscriptContent(UnsupportedTranscriptContent)` | `unsupportedContent: [Transcript.Entry]` | The transcript contains content the model can't process — unsupported file types, corrupted data, or an attachment kind your provider doesn't handle. |
 | `.unsupportedGenerationGuide(UnsupportedGenerationGuide)` | `schemaName: String?` | The generation schema uses a guide your provider doesn't support (e.g. an exotic regex pattern). |
 | `.unsupportedLanguageOrLocale(UnsupportedLanguageOrLocale)` | `languageCode: Locale.LanguageCode` | The model declined the request because the prompt language isn't supported. |
 | `.timeout(Timeout)` | — | Request didn't complete within the configured timeout window. |
@@ -803,6 +789,8 @@ What to cover end-to-end:
 
 - **`updateUsage` is wholesale, not additive.** Always send cumulative totals from the provider — never deltas.
 - **`updateMetadata` are wholesale snapshots.** A subsequent event with fewer items REMOVES the missing ones. Re-emit everything you want preserved.
+- **Metadata values are `GeneratedContent`, not arbitrary `Codable`.** You pass `any ConvertibleToGeneratedContent` and read back `GeneratedContent`. A plain Swift dictionary doesn't conform — build nested objects with `GeneratedContent(properties:)` or declare the payload `@Generable`.
+- **Put provider-specific structured payloads in metadata.** `.updateMetadata` is where a payload that isn't text, reasoning, an attachment, a citation, or an advisory belongs. See "Structured payloads — use metadata".
 - **Every `.toolCall(id:name:action:)` event must carry the function `name`** — not just the opener. Subsequent events for the same `id` should pass the same `name`.
 - **Emit per-call metadata BEFORE the first `.appendArguments` for that id.** This ensures the metadata is attached to the call the moment it's first written rather than arriving after the fact.
 - **Use `.removeToolCall(_:)` when the model retracts a streamed tool call** rather than trying to mutate prior argument deltas — there is no `replaceArguments` equivalent for tool calls.

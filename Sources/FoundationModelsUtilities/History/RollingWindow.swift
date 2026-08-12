@@ -67,16 +67,13 @@ extension LanguageModelSession.DynamicProfile {
 }
 
 private struct RollingWindowModifier: LanguageModelSession.DynamicProfileModifier {
-  @SessionProperty(\.history)
-  private var history
-
   let size: RollingWindowSize
 
   func body(content: Content) -> some DynamicProfile {
-    content.onPrompt {
+    content.historyTransform { history in
       switch size {
       case .entries(let numberOfEntries):
-        history = history.suffix(numberOfEntries)
+        return Array(history.suffix(numberOfEntries))
       }
     }
   }

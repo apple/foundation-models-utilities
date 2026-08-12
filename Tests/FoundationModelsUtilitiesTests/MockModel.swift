@@ -11,6 +11,9 @@
 //===----------------------------------------------------------------------===//
 import Foundation
 import FoundationModels
+import Synchronization
+
+
 
 struct MockModel: LanguageModel {
   typealias Executor = MockModelExecutor
@@ -26,27 +29,30 @@ struct MockModel: LanguageModel {
 
   let events: [Event]
   let tokenCount: Int
+  let recorder: TranscriptRecorder?
 
   var capabilities: LanguageModelCapabilities {
-    LanguageModelCapabilities(capabilities: [.toolCalling])
+    LanguageModelCapabilities([.toolCalling])
   }
 
   var executorConfiguration: MockModelExecutor.Configuration {
-    MockModelExecutor.Configuration(events: events, tokenCount: tokenCount)
+    MockModelExecutor.Configuration(events: events, tokenCount: tokenCount, recorder: recorder)
   }
 
   /// A model that responds with a single text response.
-  init(textResponse: String, tokenCount: Int) {
+  init(textResponse: String, tokenCount: Int, recorder: TranscriptRecorder? = nil) {
     self.events = [.text(textResponse)]
     self.tokenCount = tokenCount
+    self.recorder = recorder
   }
 
   /// A model that emits `events` in order, one per generation turn. The event
   /// for each turn is chosen by counting how many turns have already been
   /// taken for the current prompt, so the sequence restarts on every prompt.
-  init(events: [Event], tokenCount: Int) {
+  init(events: [Event], tokenCount: Int, recorder: TranscriptRecorder? = nil) {
     self.events = events
     self.tokenCount = tokenCount
+    self.recorder = recorder
   }
 }
 
@@ -54,14 +60,17 @@ struct MockModelExecutor: LanguageModelExecutor {
   struct Configuration: Hashable {
     var events: [MockModel.Event]
     var tokenCount: Int
+    var recorder: TranscriptRecorder?
   }
 
   let events: [MockModel.Event]
   let tokenCount: Int
+  let recorder: TranscriptRecorder?
 
   init(configuration: Configuration) throws {
     self.events = configuration.events
     self.tokenCount = configuration.tokenCount
+    self.recorder = configuration.recorder
   }
 
   nonisolated func respond(
@@ -69,6 +78,7 @@ struct MockModelExecutor: LanguageModelExecutor {
     model: MockModel,
     streamingInto channel: LanguageModelExecutorGenerationChannel
   ) async throws {
+    recorder?.record(request.transcript)
     switch event(for: request.transcript) {
     case .toolCall(let name, let arguments):
       await channel.send(
@@ -118,5 +128,30 @@ struct MockModelExecutor: LanguageModelExecutor {
       }
     }
     return events[min(index, events.count - 1)]
+  }
+}
+
+/// A thread-safe recorder for the transcripts a mock model observes on each
+/// generation turn. Since history modifiers built on `historyTransform` do not
+/// mutate the session's persisted transcript, tests can attach a recorder to
+/// the mock model and assert against the transcript the model actually saw for
+/// a given turn.
+final class TranscriptRecorder: Sendable, Hashable {
+  private let _transcripts = Mutex<[Transcript]>([])
+
+  var transcripts: [Transcript] {
+    _transcripts.withLock { $0 }
+  }
+
+  func record(_ transcript: Transcript) {
+    _transcripts.withLock { $0.append(transcript) }
+  }
+
+  static func == (lhs: TranscriptRecorder, rhs: TranscriptRecorder) -> Bool {
+    lhs === rhs
+  }
+
+  func hash(into hasher: inout Hasher) {
+    hasher.combine(ObjectIdentifier(self))
   }
 }
