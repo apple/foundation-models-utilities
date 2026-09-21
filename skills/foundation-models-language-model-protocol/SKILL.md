@@ -17,7 +17,7 @@ let model = MyLanguageModel(name: "your-model-id", baseURL: URL(string: "https:/
 try await model.authenticateIfNeeded()  // OAuth — user signs into their account
 
 let session = LanguageModelSession(model: model)
-let response = try await session.respond(to: "Plan a 4-day trip to Buenos Aires…")
+let response = try await session.respond(to: "Plan a 4-day trip to Panicale, Italy…")
 ```
 
 That's the whole developer surface. Same `LanguageModelSession` API as the on-device model. Your endpoint runs the inference.
@@ -27,8 +27,8 @@ That's the whole developer surface. Same `LanguageModelSession` API as the on-de
 You own the package, ship it on GitHub (open source is encouraged), and maintain it. Specifically the package:
 
 - **Translates** the framework's API calls — conversation history, tool definitions, output schema — into your inference API request shape.
-- **Declares** what your model supports — structured output, tool calling, thinking, multimodal — via `LanguageModelCapabilities`.
-- **Owns authentication** — OAuth for end-user accounts, API keys for developer-paid usage, or both.
+- **Declares** what your model supports — structured output, tool calling, thinking, multimodal — via `LanguageModelCapabilities`, plus any custom content types via `supportsDataAttachmentType(_:)` / `supportsDataEntryType(_:)`.
+- **Owns authentication** — OAuth for end-user accounts, API keys for local development, or both. Production traffic should go through your backend, gated by App Attest — see "Authentication".
 - **Surfaces errors** — including plan limits, with an upsell flow if you want to build one.
 - **Streams events** through the framework's executor channel.
 
@@ -43,6 +43,10 @@ public protocol LanguageModel: Sendable {
   associatedtype Executor: LanguageModelExecutor where Executor.Model == Self
   var capabilities: LanguageModelCapabilities { get }
   var executorConfiguration: Executor.Configuration { get }
+
+  // Opt in to custom binary payloads. Both default to `false`.
+  func supportsDataAttachmentType(_ type: UTType) async throws -> Bool
+  func supportsDataEntryType(_ type: UTType) async throws -> Bool
 }
 
 public protocol LanguageModelExecutor: Sendable {
@@ -69,6 +73,7 @@ public protocol LanguageModelExecutor: Sendable {
 ```swift
 import Foundation
 import FoundationModels
+import UniformTypeIdentifiers
 
 public struct MyLanguageModel: Sendable {
   public let modelID: String
@@ -85,6 +90,9 @@ public struct MyLanguageModel: Sendable {
   }
 
   /// Initialize with a developer-supplied API key.
+  ///
+  /// For local development. In production the key belongs on a backend the app
+  /// reaches through App Attest — see "Authentication".
   public init(name: String, apiKey: String, baseURL: URL, timeout: TimeInterval = 60) {
     self.modelID = name
     self.baseURL = baseURL
@@ -118,6 +126,19 @@ extension MyLanguageModel: LanguageModel {
       authMode: authMode,
       timeout: timeout
     )
+  }
+
+  // Custom binary payloads are opt-in — both predicates default to `false`.
+  // Omit them entirely if your model only handles text, images, and tool calls.
+
+  /// Audio the developer attaches to a prompt.
+  public func supportsDataAttachmentType(_ type: UTType) async throws -> Bool {
+    type.conforms(to: .audio)
+  }
+
+  /// The transcription payload this model emits as a standalone entry.
+  public func supportsDataEntryType(_ type: UTType) async throws -> Bool {
+    type == .audioTranscription   // a UTType your package exports
   }
 }
 ```
@@ -203,11 +224,10 @@ extension MyLanguageModel {
             )
           )
 
-        case .toolCallRetracted(let toolCall):
+        case .toolCallRetracted(let toolCallID):
           // Drop a tool call the model started streaming and then retracted.
-          // `removeToolCall` takes the `Transcript.ToolCall` to drop.
           await channel.send(
-            .toolCalls(entryID: toolCallsEntryID, action: .removeToolCall(toolCall))
+            .toolCalls(entryID: toolCallsEntryID, action: .removeToolCall(id: toolCallID))
           )
 
         case .reasoningDelta(let text):
@@ -318,6 +338,8 @@ Declare what your model can do. Don't declare a capability you don't fully suppo
 | Reasoning | `.reasoning` | Model produces structured reasoning separate from response text. Emit `.reasoning(...)` events — a top-level event peer to `.response` and `.toolCalls` — as reasoning streams. |
 | Structured output | `.guidedGeneration` | Model strictly conforms output to a JSON Schema. Forward `request.schema` into your provider's structured-output / JSON-mode field. |
 
+Custom binary payloads are **not** capabilities. You opt into those per content type with `supportsDataAttachmentType(_:)` and `supportsDataEntryType(_:)` — see "Custom payloads — data attachments and data entries".
+
 ## Authentication
 
 You own auth. Two common patterns, both shown on the model type above.
@@ -344,11 +366,15 @@ The developer supplies the key at construction time. No interactive flow.
 public init(name: String, apiKey: String, ...) { ... }
 ```
 
+**Use this for local development only.** A key shipped in an app binary is a key in everyone's hands — anything embedded in source, an `Info.plist`, an `.xcconfig`, or a bundled resource is extractable from the download. Keep keys out of git entirely (environment variable or an ignored local config the developer reads at launch), and never let one reach a release build.
+
+For production, the app should never hold the key. Route requests through your own backend, and have it prove the caller is your genuine, unmodified app with [App Attest](https://developer.apple.com/documentation/devicecheck/establishing-your-app-s-integrity) before it forwards to the inference API — attest once at first launch, then send an assertion with each request. Your backend holds the key; the app holds nothing worth stealing. Say this in your package README too, since it's the app developer who has to act on it.
+
 You can offer both initializers from the same model type. The `Configuration` should hash on a stable identity (the OAuth `accountID`, or the API key itself) so two sessions for two different users get distinct cached executors.
 
 ## The Event API — full reference
 
-Events are sent on `LanguageModelExecutorGenerationChannel` via `await channel.send(...)`. Three top-level cases — each is a peer transcript-entry kind: `.response`, `.toolCalls`, and `.reasoning`.
+Events are sent on `LanguageModelExecutorGenerationChannel` via `await channel.send(...)`. Four top-level cases — each is a peer transcript-entry kind: `.response`, `.toolCalls`, `.reasoning`, and `.data`.
 
 ### Response events — `.response(entryID:action:)`
 
@@ -358,10 +384,10 @@ Events are sent on `LanguageModelExecutorGenerationChannel` via `await channel.s
 |---|---|
 | `.appendText(_:segmentID:tokenCount:)` | Each chunk of model-generated user-facing text. |
 | `.replaceTextSegment(_:segmentID:tokenCount:)` | Whole-segment replacement when your provider sends a final corrected version. |
-| `.addAttachmentSegment(_:)` | Add a `Transcript.AttachmentSegment` (currently image content) to the response. Use this when your model emits non-text output inline — e.g. a generated diagram, edited image, or visual artifact. Each call ADDS a new segment; pass a stable `id` if you'll later remove it. See "Attachment segments" below. |
-| `.removeAttachmentSegment(_:)` | Remove a previously-added attachment by passing the `Transcript.AttachmentSegment` to drop. Symmetric to `.removeToolCall(_:)` — use when the model retracts an attachment mid-stream, or as the first half of a remove-then-add replacement. |
+| `.addAttachmentSegment(_:)` | Add a `Transcript.AttachmentSegment` (image or data content) to the response. Use this when your model emits non-text output inline — e.g. a generated diagram, edited image, or visual artifact. Each call ADDS a new segment; pass a stable `id` if you'll later remove it. See "Attachment segments" below. |
+| `.removeAttachmentSegment(id:)` | Remove a previously-added attachment by its segment `id`. Symmetric to `.removeToolCall(id:)` — use when the model retracts an attachment mid-stream, or as the first half of a remove-then-add replacement. |
 | `.updateMetadata(_:)` | Wholesale snapshot of entry metadata. Takes `[String: any ConvertibleToGeneratedContent]`, so pass values unwrapped (`["provider": "acme", "attempt": 2]`). Re-emit every key on every event. |
-| `.updateUsage(input:output:)` | Cumulative running totals. Each event REPLACES prior totals (does not add). Authoritative. |
+| `.updateUsage(input:output:metadata:)` | Cumulative running totals. Each event REPLACES prior totals (does not add). Authoritative. `metadata` is optional extra context recorded alongside the counts. |
 
 ### Reasoning events — `.reasoning(entryID:action:)`
 
@@ -375,7 +401,7 @@ Reasoning is a top-level event peer to `.response` and `.toolCalls`. Each event 
 | `.replaceTextSegment(_:segmentID:tokenCount:)` | Replace the entry's current reasoning text segment wholesale (e.g. provider sent a corrected/finalized thought). |
 | `.updateSignature(_:tokenCount:)` | Replace the entry's signature wholesale. Pass opaque bytes as `Data` — don't UTF-8 decode signatures assuming text. |
 | `.updateMetadata(_:)` | Wholesale metadata snapshot for the reasoning entry. |
-| `.updateUsage(input:output:)` | Cumulative usage totals. Each event REPLACES prior totals. Reasoning-token totals are also accumulated separately by the framework from `appendText` token counts, so emit `updateUsage` only when your provider reports authoritative totals. |
+| `.updateUsage(input:output:metadata:)` | Cumulative usage totals. Each event REPLACES prior totals. Reasoning-token totals are also accumulated separately by the framework from `appendText` token counts, so emit `updateUsage` only when your provider reports authoritative totals. |
 
 ### Tool-call events — `.toolCalls(entryID:action:)`
 
@@ -386,9 +412,9 @@ Use a DIFFERENT `entryID` from your response entry — they live in different tr
 | Outer action | When to use |
 |---|---|
 | `.toolCall(id:name:action:)` | Wraps a per-call event. `id` selects (or opens) the tool call; `name` carries the function name on every event for that id; `action` names the mutation (see inner table). |
-| `.removeToolCall(_:)` | Drop a tool call the model streamed and then retracted. Pass the `Transcript.ToolCall` to remove. |
+| `.removeToolCall(id:)` | Drop a tool call the model streamed and then retracted. Pass the `id` of the call to remove. |
 | `.updateMetadata(_:)` | Entry-level metadata snapshot. Prefer per-call metadata via `.toolCall(..., .updateMetadata(...))` for values that belong to one specific call. |
-| `.updateUsage(input:output:)` | Usage totals. Cumulative, not additive — each event REPLACES prior totals. |
+| `.updateUsage(input:output:metadata:)` | Usage totals. Cumulative, not additive — each event REPLACES prior totals. |
 
 Inner `ToolCall.Action` — what you set on `.toolCall(id:name:action:)`:
 
@@ -399,43 +425,46 @@ Inner `ToolCall.Action` — what you set on `.toolCall(id:name:action:)`:
 
 > If your provider emits reasoning interleaved with tool calls (e.g. a thought trace before picking a function), send it as a `.reasoning(entryID:..., action: ...)` event. Reasoning has its own transcript entries — they sit alongside the tool-calls entry in the transcript, not inside it.
 
-## Structured payloads — use metadata
+### Data-entry events — `.data(entryID:action:)`
 
-When your provider returns a structured payload that doesn't fit any of the framework's built-in segment kinds (text, reasoning, attachments, citations, advisories), put it in entry metadata with `.updateMetadata(_:)`. Values are stored as `GeneratedContent`, so nested objects and arrays round-trip and survive transcript serialization.
+A `.data` event writes a `Transcript.DataEntry` — a top-level entry holding opaque bytes plus a content type — into the developer's transcript. Use it for a payload your model produces that no message owns: web-search attributions, a transcription artifact, a trace blob your own SDK knows how to decode. Anything the developer sends *in* belongs in an attachment instead — see "Custom payloads" below.
 
-`.updateMetadata(_:)` takes `[String: any ConvertibleToGeneratedContent]`. `String`, `Int`, `Double`, `Bool`, `Decimal`, arrays of those, and any `@Generable` type conform. For an ad-hoc nested object, build a `GeneratedContent(properties:)` — a plain Swift dictionary does *not* conform:
+| Action | When to use |
+|---|---|
+| `.update(contentType:content:metadata:)` | Upsert the entry: replaces the entry matching `entryID`, or appends a new one when no match exists (including when `entryID` is `nil`). `contentType` is a `UTType`, `content` is `Data`, `metadata` is a `GeneratedContent` (defaults to empty). |
 
 ```swift
-// Web-search results as response metadata:
-let searchResults = results.map { result in
-  GeneratedContent(properties: ["title": result.title, "url": result.url.absoluteString])
-}
-
 await channel.send(
-  .response(
-    entryID: responseEntryID,
-    action: .updateMetadata(["searchResults": searchResults])
+  .data(
+    entryID: transcriptionEntryID,
+    action: .update(
+      contentType: .audioTranscription,          // a UTType your package exports
+      content: try JSONEncoder().encode(payload),
+      metadata: GeneratedContent(properties: ["durationSeconds": 12.5])
+    )
   )
 )
 ```
 
-The developer reads it back off `Transcript.Response.metadata`, which is `[String: GeneratedContent]`:
+The `contentType` has to clear your model's `supportsDataEntryType(_:)` — see "Opting in" below.
+
+## Entry metadata — annotations, not payloads
+
+`.updateMetadata(_:)` is for small provider annotations *about* an entry — a model version, a request id, a moderation label. It takes `[String: any ConvertibleToGeneratedContent]` (`String`, `Int`, `Double`, `Bool`, `Decimal`, arrays of those, and any `@Generable` type conform; a plain Swift dictionary does *not* — build nested objects with `GeneratedContent(properties:)`). The developer reads it back off `Transcript.Response.metadata`, a `[String: GeneratedContent]`.
+
+Every metadata update is a **wholesale snapshot**: the dictionary you send replaces the entry's metadata entirely, so re-emit every key you want preserved on each event. A later event with fewer keys removes the missing ones.
 
 ```swift
-if let results = response.metadata["searchResults"] {
-  for result in try results.value([GeneratedContent].self) {
-    let title = try result.value(String.self, forProperty: "title")
-  }
-}
+await channel.send(
+  .response(entryID: responseEntryID, action: .updateMetadata(["provider": "acme", "attempt": 2]))
+)
 ```
 
-If the payload has a fixed shape, declaring it `@Generable` is nicer on both sides — pass the value straight into `.updateMetadata` and read it back with `try results.value([SearchResult].self)`.
-
-Metadata is a wholesale snapshot — re-emit every key you want preserved on each event.
+For anything bigger — a provider-specific structured payload like web-search attributions, a transcription artifact, a trace blob — use a data attachment or a data entry instead. They carry your own type, they're not clobbered by the next snapshot, and the developer gets it back as their own type via `DataAttachmentRepresentable` / `DataEntryRepresentable`. See "Custom payloads — data attachments and data entries".
 
 ## Attachment segments
 
-When your model produces non-text output inline with its response — currently images, with the enum designed to grow to other media types — emit it as an attachment segment. The framework places the attachment in the developer's transcript alongside the response text so they can render or persist it. This is the streaming-out counterpart to the `.vision` capability, which describes streaming-*in* image input.
+When your model produces non-text output inline with its response — an image, or a custom payload of your own — emit it as an attachment segment. The framework places the attachment in the developer's transcript alongside the response text so they can render or persist it. This is the streaming-out counterpart to the `.vision` capability, which describes streaming-*in* image input.
 
 ```swift
 public struct AttachmentSegment: Sendable, Identifiable, Equatable {
@@ -446,6 +475,7 @@ public struct AttachmentSegment: Sendable, Identifiable, Equatable {
 
 public enum Attachment: Sendable, Equatable {
   case image(ImageAttachment)
+  case data(DataAttachment)   // opaque bytes + a UTType, see the next section
 }
 ```
 
@@ -465,21 +495,69 @@ await channel.send(
 
 | Field | Notes |
 |---|---|
-| `id` | Stable identifier for this attachment within the response. Mint a UUID. Keep the `AttachmentSegment` around (or rebuild one with the same `id`) if you later need to `.removeAttachmentSegment(_:)`. |
-| `content` | A `Transcript.Attachment` enum — currently `.image(ImageAttachment)`. Build the `ImageAttachment` from a `CGImage`, `CIImage`, `CVPixelBuffer`, or a `URL`. |
-| `label` | Optional human-readable label (e.g. caption or alt-text). |
+| `id` | Stable identifier for this attachment within the response. Mint a UUID, and hold onto it if you later need to `.removeAttachmentSegment(id:)`. |
+| `content` | A `Transcript.Attachment` enum — `.image(ImageAttachment)` or `.data(DataAttachment)`. Build the `ImageAttachment` from a `CGImage`, `CIImage`, `CVPixelBuffer`, or a `URL`. |
+| `label` | Optional human-readable label (e.g. caption or alt-text). Labels are also how the model refers to a specific attachment in a tool call. |
 
-To retract or supersede an attachment, send `.removeAttachmentSegment(_:)` with the segment to drop:
+To retract or supersede an attachment, send `.removeAttachmentSegment(id:)` with the segment's id:
 
 ```swift
 await channel.send(
-  .response(entryID: responseEntryID, action: .removeAttachmentSegment(attachment))
+  .response(entryID: responseEntryID, action: .removeAttachmentSegment(id: imageID))
 )
 ```
 
 There is no `replaceAttachmentSegment` — to replace an attachment with a refined version, send a `removeAttachmentSegment` followed by a fresh `addAttachmentSegment` (with either the same `id` or a new one). Each `addAttachmentSegment` ADDS a new segment; it does not replace an existing one of the same id.
 
 Reach for an attachment segment whenever your provider returns binary media as part of the assistant turn — generated images, image edits, or visual diagnostic artifacts. For provider-specific *metadata about* media (e.g. a moderation label on an image), use `.updateMetadata`.
+
+## Custom payloads — data attachments and data entries
+
+Text, images, reasoning, and tool calls cover most of what flows through a transcript. For anything else — an audio buffer, a document, a proprietary payload your SDK understands — the framework carries **opaque bytes plus a `UTType`**, in two shapes:
+
+| Shape | Where it lives | Direction | You handle it by |
+|---|---|---|---|
+| `Transcript.DataAttachment` | Inside an `AttachmentSegment`, on a prompt, instructions, response, or tool-output entry | Mostly in — the developer attaches it to a prompt | Translating it in your transcript walk, and opting in with `supportsDataAttachmentType(_:)` |
+| `Transcript.DataEntry` | A top-level transcript entry of its own | Out only — there's no prompt segment for one, so it enters the transcript as model output | Sending `.data(entryID:action: .update(...))`, and opting in with `supportsDataEntryType(_:)` |
+
+That direction is the deciding factor. If the payload is something the developer hands *to* the model — the audio clip they recorded, a document they picked — it's an attachment. If it's something your model produces *about* the turn and no message owns it — web-search attributions, a transcription artifact — it's an entry.
+
+Both are the same three fields, and both round-trip through the transcript's `Codable` conformance — a persisted transcript stays readable even where the package that declared the type isn't installed:
+
+```swift
+public struct DataAttachment: Sendable, Equatable {
+  public var contentType: UTType
+  public var content: Data
+  public var metadata: GeneratedContent
+}
+```
+
+### Opting in
+
+Both predicates default to `false`. The framework calls `supportsDataAttachmentType(_:)` for every data attachment in the transcript **before** dispatching to your executor, and `supportsDataEntryType(_:)` for every data entry your executor sends **before** appending it — anything you don't accept surfaces to the developer as `LanguageModelError.unsupportedTranscriptContent`. So your executor only ever sees payloads you claimed. See Step 1 for where they sit on your model type.
+
+Declare a dedicated `UTType` (conforming to `.data`, or something more specific like `.json`) and expose it as a static member so app developers can match on it directly:
+
+```swift
+extension UTType {
+  public static let audioTranscription = UTType(exportedAs: "com.example.audio-transcription")
+}
+```
+
+The predicates are `async throws`, so a model that has to ask a server which formats it accepts can do that here.
+
+### Developer-defined types
+
+App developers rarely build a `DataAttachment` by hand. They conform their own type to `DataAttachmentRepresentable` — `init(_ attachment:) throws` to rehydrate, `transcriptRepresentation` to render — and pass it into a prompt:
+
+```swift
+let response = try await session.respond {
+  "What is in this clip?"
+  Attachment(buffer).label("clip-0")
+}
+```
+
+That arrives in your executor as a `.attachment` segment on the prompt entry whose content is `.data(...)`. `DataEntryRepresentable` is the same protocol pair for top-level entries.
 
 ## Translating `request.transcript` → provider request
 
@@ -488,11 +566,12 @@ Reach for an attachment segment whenever your provider returns binary media as p
 ```swift
 public enum Entry {
   case instructions(Instructions)  // system prompt
-  case prompt(Prompt)              // user message (may contain text + images)
+  case prompt(Prompt)              // user message (may contain text + attachments)
   case toolCalls(ToolCalls)        // model's prior tool calls
   case toolOutput(ToolOutput)      // results returned from those tools
   case response(Response)          // model's prior text response
   case reasoning(Reasoning)        // model's prior reasoning
+  case data(DataEntry)             // opaque bytes + UTType, no message role
 }
 ```
 
@@ -501,11 +580,12 @@ Map this to your provider's chat-message array. Typical translation:
 | Entry | Common provider role | Notes |
 |---|---|---|
 | `.instructions` | `system` | Concatenate text segments. |
-| `.prompt` | `user` | Walk `segments` — text and images interleaved; forward as your provider's content blocks. |
+| `.prompt` | `user` | Walk `segments` — text, images, and data attachments interleaved; forward as your provider's content blocks. |
 | `.toolCalls` | `assistant` | Emit a message with the provider's tool-calls array. |
 | `.toolOutput` | `tool` (or `user`, depending on provider convention) | One per tool result. |
 | `.response` | `assistant` | The model's prior text. Concatenate text segments. |
 | `.reasoning` | provider-specific | Model's prior reasoning. If your provider preserves reasoning across turns (e.g. as a dedicated field on assistant messages, or via a signature it requires you to echo back), forward `segments` and `signature` accordingly. When `signature` is non-nil, `segments` may be a partial summary rather than the full reasoning — treat the signature as the authoritative anchor. If your provider does not accept prior reasoning, drop these entries — the framework keeps them in the transcript for downstream consumers regardless. |
+| `.data` | none, usually | Opaque bytes with no message role. Forward it only if you know the `contentType` and your provider has somewhere to put it; otherwise skip the entry — a transcript may carry data entries meant for a different model or for the app itself. |
 
 ## Translating provider stream events → channel events
 
@@ -516,13 +596,15 @@ Patterns repeat across providers:
 | Text delta in assistant message | `.response(.appendText)` |
 | Tool/function call open + first args chunk | `.toolCalls(.toolCall(id:name:action: .appendArguments(...)))` (first event for a new id opens the call) |
 | Tool/function call args delta | `.toolCalls(.toolCall(id:name:action: .appendArguments(...)))` (same id and name as the open event) |
-| Tool/function call retracted mid-stream | `.toolCalls(.removeToolCall(_:))` |
+| Tool/function call retracted mid-stream | `.toolCalls(.removeToolCall(id:))` |
 | Per-call metadata (e.g. a provider-supplied call tag) | `.toolCalls(.toolCall(id:name:action: .updateMetadata(...)))` — emit BEFORE the first `.appendArguments` for the id |
 | Reasoning / thinking text delta | `.reasoning(entryID: …, action: .appendText(...))` — pass `entryID: nil` to coalesce consecutive deltas, or a stable id to anchor a specific entry |
 | Reasoning text superseded by a finalized version | `.reasoning(entryID: …, action: .replaceTextSegment(...))` |
 | Reasoning signature bytes | `.reasoning(entryID: …, action: .updateSignature(Data, tokenCount:))` — opaque bytes, replaces wholesale |
 | Inline image output (model-generated image / diagram / edited asset) | `.response(.addAttachmentSegment(Transcript.AttachmentSegment(content: .image(...))))` |
-| Image output retracted or superseded | `.response(.removeAttachmentSegment(_:))` — followed by a fresh `addAttachmentSegment` to replace |
+| Inline custom binary output (audio, document, proprietary payload) | `.response(.addAttachmentSegment(Transcript.AttachmentSegment(content: .data(Transcript.DataAttachment(contentType:content:)))))` |
+| Standalone binary payload with no message role | `.data(entryID: …, action: .update(contentType:content:metadata:))` — upserts a `Transcript.DataEntry` |
+| Image output retracted or superseded | `.response(.removeAttachmentSegment(id:))` — followed by a fresh `addAttachmentSegment` to replace |
 | Token usage report | `.response(.updateUsage)` — or `.reasoning(.updateUsage)` / `.toolCalls(.updateUsage)` if your provider scopes usage to that entry |
 | Asset / model metadata | `.response(.updateMetadata)` |
 
@@ -537,7 +619,7 @@ Throw typed `LanguageModelError` cases so the framework can surface user-friendl
 | `.guardrailViolation(GuardrailViolation)` | — | Provider's safety system flagged the prompt or the response. |
 | `.refusal(Refusal)` | `explanation: String` (required by the public initializer) | Model declined to answer for non-safety reasons (e.g. asked for something out of scope). Surfaced to the developer via `refusal.explanation` / `refusal.explanationStream`. |
 | `.unsupportedCapability(UnsupportedCapability)` | `capability: LanguageModelCapabilities.Capability` | A capability you didn't declare was requested. The framework throws this for you when you under-declare — only throw it manually when your provider rejects a capability mid-stream. |
-| `.unsupportedTranscriptContent(UnsupportedTranscriptContent)` | `unsupportedContent: [Transcript.Entry]` | The transcript contains content the model can't process — unsupported file types, corrupted data, or an attachment kind your provider doesn't handle. |
+| `.unsupportedTranscriptContent(UnsupportedTranscriptContent)` | `unsupportedContent: [Transcript.Entry]` | The transcript contains content the model can't process — unsupported file types, corrupted data, or an attachment kind your provider doesn't handle. The framework throws this for you when a data attachment or data entry fails your `supportsData…Type(_:)` predicate. |
 | `.unsupportedGenerationGuide(UnsupportedGenerationGuide)` | `schemaName: String?` | The generation schema uses a guide your provider doesn't support (e.g. an exotic regex pattern). |
 | `.unsupportedLanguageOrLocale(UnsupportedLanguageOrLocale)` | `languageCode: Locale.LanguageCode` | The model declined the request because the prompt language isn't supported. |
 | `.timeout(Timeout)` | — | Request didn't complete within the configured timeout window. |
@@ -679,6 +761,7 @@ let package = Package(
     // The LanguageModel / LanguageModelExecutor protocols are available on
     // iOS 27, macOS 27, visionOS 27, and watchOS 27. Set your minimums at or
     // above those, plus whatever your transport/auth dependencies require.
+    // Data attachments and entries need 27.2 — gate with `@available`.
   ],
   products: [
     .library(name: "MyLanguageModel", targets: ["MyLanguageModel"]),
@@ -784,17 +867,21 @@ What to cover end-to-end:
 - Cancellation mid-stream.
 - Each error type (`rateLimited`, `contextSizeExceeded`, `guardrailViolation`, your custom `planLimitReached`).
 - Image input round-trip if you support `.vision`.
+- Data attachment round-trip if you accept custom content types: one accepted type reaches the executor, one rejected type throws `unsupportedTranscriptContent` before dispatch.
 
 ## Pitfalls
 
+- **Never ship an API key in an app.** Key-in-constructor is a development affordance — it's extractable from any release build, and it must never be committed. Production goes through your backend with App Attest.
 - **`updateUsage` is wholesale, not additive.** Always send cumulative totals from the provider — never deltas.
 - **`updateMetadata` are wholesale snapshots.** A subsequent event with fewer items REMOVES the missing ones. Re-emit everything you want preserved.
+- **`supportsDataAttachmentType(_:)` and `supportsDataEntryType(_:)` default to `false`.** Emitting a `.data` event without overriding the entry predicate means your own payload comes back at you as `unsupportedTranscriptContent`.
+- **A `.data` event upserts.** Re-sending `.update(...)` with the same `entryID` replaces that entry wholesale; a new `entryID` appends another one. There's no append-bytes action — accumulate on your side and update when you have a coherent payload.
 - **Metadata values are `GeneratedContent`, not arbitrary `Codable`.** You pass `any ConvertibleToGeneratedContent` and read back `GeneratedContent`. A plain Swift dictionary doesn't conform — build nested objects with `GeneratedContent(properties:)` or declare the payload `@Generable`.
-- **Put provider-specific structured payloads in metadata.** `.updateMetadata` is where a payload that isn't text, reasoning, an attachment, a citation, or an advisory belongs. See "Structured payloads — use metadata".
+- **Custom payloads go in a data attachment or data entry, not metadata.** Metadata is for small annotations about an entry, and every update clobbers the last one. Anything structured or provider-specific — search attributions, a transcription artifact, a proprietary blob — belongs in a `DataAttachment` (developer → model) or a `DataEntry` (model → developer). See "Custom payloads — data attachments and data entries".
 - **Every `.toolCall(id:name:action:)` event must carry the function `name`** — not just the opener. Subsequent events for the same `id` should pass the same `name`.
 - **Emit per-call metadata BEFORE the first `.appendArguments` for that id.** This ensures the metadata is attached to the call the moment it's first written rather than arriving after the fact.
-- **Use `.removeToolCall(_:)` when the model retracts a streamed tool call** rather than trying to mutate prior argument deltas — there is no `replaceArguments` equivalent for tool calls.
-- **Attachments add, they don't replace.** `.addAttachmentSegment` always adds a new segment. To supersede a streamed attachment, send `.removeAttachmentSegment(_:)` followed by a fresh `.addAttachmentSegment(...)` — there is no `replaceAttachmentSegment`.
+- **Use `.removeToolCall(id:)` when the model retracts a streamed tool call** rather than trying to mutate prior argument deltas — there is no `replaceArguments` equivalent for tool calls.
+- **Attachments add, they don't replace.** `.addAttachmentSegment` always adds a new segment. To supersede a streamed attachment, send `.removeAttachmentSegment(id:)` followed by a fresh `.addAttachmentSegment(...)` — there is no `replaceAttachmentSegment`.
 - **Don't try to "fix up" prior text via mutation.** Use `replaceTextSegment` if your provider sends a final corrected version.
 - **Reasoning signatures are opaque bytes.** Don't UTF-8 decode them assuming text; pass them through as `Data`.
 - **Pick an `entryID` strategy for reasoning and stick to it.** Passing `nil` coalesces consecutive deltas into the trailing reasoning entry — fine for one-thought-block flows. But if you alternate `nil` and explicit ids, or interleave reasoning with a non-reasoning event in between, you can split a single thought across two transcript entries unintentionally. When in doubt, anchor with a stable id you mint yourself.
