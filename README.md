@@ -27,7 +27,7 @@ Add as a dependency to your Swift package `Package.swift` file like this:
 let package = Package(
     name: "YourApp",
     dependencies: [
-        .package(url: "https://github.com/apple/foundation-models-utilities", from: "1.0.0")
+        .package(url: "https://github.com/apple/foundation-models-utilities", from: "1.0.0-beta6")
     ],
     targets: [
         .target(
@@ -49,7 +49,7 @@ The `ChatCompletionsLanguageModel` can communicate with any server that uses the
 ```swift
 let model = ChatCompletionsLanguageModel(
   name: "minimax-m2.5",
-  url: URL(string: "http://localhost/v1:8000")!,
+  url: URL(string: "http://localhost:8000/v1")!,
 )
 
 let session = LanguageModelSession(model: model)
@@ -64,7 +64,7 @@ When initializing the model, you can specify some of its capabilities based on t
 ```swift
 let model = ChatCompletionsLanguageModel(
   name: "minimax-m2.5",
-  url: URL(string: "http://localhost/v1:8000")!,
+  url: URL(string: "http://localhost:8000/v1")!,
   supportsGuidedGeneration: false
 )
 ```
@@ -97,7 +97,7 @@ struct MyProfile: LanguageModelSession.DynamicProfile {
 
 `Skills` allow adding extra directions about performing specific tasks into a `LanguageModelSession` transcript on a just-in-time basis. This prevents context pollution and helps optimize time-to-first-token.
 
-The `Skills` type conforms to `DynamicInstructions` and is initialized using a result builder. You must provide a `SkillActivations` instance that tracks which skills are currently active. Because `SkillActivations` conforms to `Observable` and `RandomAccessCollection`, you can use it to drive UI updates.
+The `Skills` type conforms to `DynamicInstructions` and is initialized using a result builder. You must provide a `SkillActivations` instance that tracks which skills are currently active. Because `SkillActivations` conforms to `Observable`, you can use it to drive UI updates.
 
 ```swift
 @Observable

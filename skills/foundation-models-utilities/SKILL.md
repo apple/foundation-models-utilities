@@ -6,15 +6,15 @@ description: Use this skill when working with the `FoundationModelsUtilities` Sw
 
 # FoundationModelsUtilities
 
-`FoundationModelsUtilities` is a Swift package that adds practical utilities on top of Apple's Foundation Models framework. It is built to compose with the framework's `LanguageModelSession`, `Profile`, and `DynamicProfile` APIs — not replace them. Three independent feature areas, each guarded by its own SwiftPM trait:
+`FoundationModelsUtilities` is a Swift package that adds practical utilities on top of Apple's Foundation Models framework. It is built to compose with the framework's `LanguageModelSession`, `Profile`, and `DynamicProfile` APIs — not replace them. Three independent feature areas:
 
-| Trait | What it adds |
+| Feature area | What it adds |
 |---|---|
-| `ChatCompletions` | `ChatCompletionsLanguageModel` — a `LanguageModel` that talks to any OpenAI-compatible `/chat/completions` endpoint and streams results back through Foundation Models. |
-| `Skills` | `Skill`, `Skills`, `SkillActivations`, `SkillsBuilder` — on-demand instructions or prompt fragments the model can activate by issuing a tool call. |
-| `History` | `summarizeHistory(...)`, `rollingWindow(entries:)`, `droppingCompletedToolCalls()` — `DynamicProfile` modifiers that compress the transcript before each generation. |
+| Chat Completions | `ChatCompletionsLanguageModel` — a `LanguageModel` that talks to any OpenAI-compatible `/chat/completions` endpoint and streams results back through Foundation Models. |
+| Skills | `Skill`, `Skills`, `SkillActivations`, `SkillsBuilder` — on-demand instructions or prompt fragments the model can activate by issuing a tool call. |
+| History | `summarizeHistory(...)`, `rollingWindow(entries:)`, `droppingCompletedToolCalls()` — `DynamicProfile` modifiers that compress the transcript before each generation. |
 
-All three traits are enabled by default, so for most apps `import FoundationModelsUtilities` is all that's needed.
+All three features are always available; `import FoundationModelsUtilities` is all that's needed.
 
 ```swift
 import FoundationModels
@@ -147,7 +147,7 @@ Choose prompt-based when the body is large or only relevant for one turn (style 
 
 ### `SkillActivations` — observable, collection-conforming activation state
 
-`SkillActivations` is a `Sendable` reference type that tracks active skill names. It is **observable** (`@Observable` semantics via `ObservationRegistrar`) and conforms to `RandomAccessCollection<String>`, so a SwiftUI view can iterate it and re-render when the model activates a skill. Mutations are guarded by a `Mutex` so it's safe to share across actors.
+`SkillActivations` is a `Sendable` reference type that tracks active skill names. It is **observable** (`@Observable` semantics via `ObservationRegistrar`) so a SwiftUI view can re-render when the model activates a skill. Mutations are guarded by a `Mutex` so it's safe to share across actors. Access the current set of active skill names via `activeSkillNames`, or query a single name with `isActive(_:)`.
 
 ```swift
 @Observable final class Assistant {
@@ -155,7 +155,7 @@ Choose prompt-based when the body is large or only relevant for one turn (style 
 }
 
 // In a SwiftUI view:
-ForEach(assistant.activations, id: \.self) { name in
+ForEach(assistant.activations.activeSkillNames, id: \.self) { name in
   Text("Active skill: \(name)")
 }
 ```
